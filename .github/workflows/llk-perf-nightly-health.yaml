@@ -1,6 +1,9 @@
 name: "LLK perf nightly health"
 
 on:
+  push:
+    branches:
+      - "perf-trial/nightly-health"
   schedule:
     - cron: '0 9 * * *'
   workflow_dispatch:
@@ -35,7 +38,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SLACK_BOT_TOKEN: ${{ secrets.LLK_SLACK_REPORTING_BOT_TOKEN }}
           OWNER_SLACK_ID: U0BCPNHUF43
-          DAY: ${{ inputs.date }}
+          DAY: ${{ inputs.date || '2026-10-13' }}
         run: |
           python3 tt_metal/tt-llk/perf/nightly_health.py \
             --repo "$GITHUB_REPOSITORY" --channel "$OWNER_SLACK_ID" ${DAY:+--date "$DAY"}
