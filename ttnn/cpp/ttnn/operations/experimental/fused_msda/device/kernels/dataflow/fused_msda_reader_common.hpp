@@ -2,61 +2,31 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// Shared reader body for fused multi-scale deformable attention.
+// Shared reader body. V1 and V2 differ only in which bf16 pair a sampling
+// position is built from. Staging, the SFPU hand-off, the gather and the
+// input-tile contract live here.
 //
-// V1 (reader_msda_v1.cpp) and V2 (reader_msda_v2.cpp) differ in exactly one
-// step: which bf16 operands a (row, level, point) sampling position is built
-// from. Everything else — staging, the hand-off of the geometry to the SFPU, the
-// NoC gather of the four bilinear neighbours, the tile scatter and the input-tile
-// contract with the compute kernel — lives here and is compiled once per reader.
+// No float arithmetic happens here. The dataflow RISC has no FPU, so every
+// float operation would cost ~140 cycles of soft-float emulation. This file
+// moves bf16 bit patterns and decodes the floored corner with integer shifts.
 //
-// No float arithmetic happens in this file, by design: the dataflow RISC has no
-// FPU, so every float operation here would cost ~140 cycles of soft-float
-// emulation. The reader moves bf16 *bit patterns* into tiles and decodes the
-// floored corner the SFPU hands back with integer shifts.
-//
-// The operand names differ either side of the boundary: `geom_*` carries what
-// the host constants call the *primary* operand (the location for V1, the
-// reference point for V2) and `offset_*` the *secondary* one.
-//
-// The two streams crossing the reader/compute boundary
-// ----------------------------------------------------
-// One output block carries up to 32 queries of a single (batch, head), packed
-// vertically into N_D_TILES tiles laid side by side (32 value-channels each).
-// For that block, per sampling point (one (level, point) pair):
-//
-//   reader -> compute   geom_x, geom_y, attn_tile     column-0 tiles, one per
-//                       [+ offset_x, offset_y for V2]  point
-//   compute -> reader   x0, y0                        floor(px), floor(py) as
-//                                                      bf16 integers
-//   reader -> compute   4 x input_tiles               the gathered corners
-//   compute -> compute  4 x scalar_tile               attn * corner coefficient
-//
-// The compute kernel evaluates dest[row, col] = input[row, col] * scalar[row, 0]
-// (COL broadcast) and accumulates in L1, so summing the four corners of a point
-// *is* the bilinear interpolation and summing over (level, point) is the MSDA
-// reduction — one accumulator, no intermediate sampled-value tensor.
-//
-// Pipelining. The reader pushes point j+1's geometry tiles *before* it waits for
-// point j's corners, and the compute kernel solves point j+1's geometry before
-// reducing point j. Without that one-point lookahead the two would ping-pong:
-// the reader idle through every geometry solve, compute idle through every
-// gather. See the CB depths in fused_msda_program_factory.cpp, which are what
-// make the lookahead legal.
+// The reader pushes point j+1's geometry tiles before it waits for point j's
+// corners. Without that lookahead the reader is idle through every geometry
+// solve and compute is idle through every gather. The CB depths in
+// fused_msda_program_factory.cpp are what make the lookahead legal.
 //
 // Tile face layout (bf16, 32x32 = 4 faces of 16x16, 2048 B) is documented in
 // ../msda_tile_layout.hpp.
 //
-// Contract with compute_msda.cpp
+// Contract with compute_msda.cpp:
 //   * geom/offset/attn tiles: column 0 is written for all 32 rows on every
-//     emission; rows >= v_rows get bf16 0. A zero attn lane is what makes a tail
-//     row's scalar zero, so tail rows cost nothing downstream. Columns 1..31 are
-//     zeroed once per CB slot at startup so an uninitialised L1 bit pattern
-//     never reaches the SFPU as a NaN.
-//   * input tile: rows that are in range AND in bounds hold the gathered value
+//     emission; rows >= v_rows get bf16 0. Columns 1..31 are zeroed once per
+//     CB slot at startup so an uninitialised L1 bit pattern never reaches the
+//     SFPU as a NaN.
+//   * input tile: rows that are in range and in bounds hold the gathered value
 //     stick; every other row is explicitly zeroed. The scalar is built by the
-//     compute kernel, which has no bounds information, so nothing downstream can
-//     annihilate a stale row.
+//     compute kernel, which has no bounds information, so nothing downstream
+//     can annihilate a stale row.
 //
 // Runtime-arg layout (identical for both readers):
 //   [0]                 value buffer address

@@ -23,10 +23,9 @@
 //     px = ref_x * primary_scale + off_x * secondary_scale + bias
 //
 // with the three constants folded per level on the host. This reader only
-// decides *which* bf16 pair is the reference and which is the offset; it does
-// no arithmetic on either. Everything after that is
-// fused_msda_reader_common.hpp, byte-identical to V1 — which is what makes V2 a
-// pure frontend and not a different operator.
+// decides which bf16 pair is the reference and which is the offset; it does
+// no arithmetic on either. The gather and the input-tile contract live in
+// fused_msda_reader_common.hpp, compiled with FROM_OFFSETS set.
 
 #include "ttnn/cpp/ttnn/operations/experimental/fused_msda/device/kernels/dataflow/fused_msda_reader_common.hpp"
 
