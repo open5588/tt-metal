@@ -59,7 +59,8 @@ class _HistoryExchange:
     """Persistent state of the convolution's fabric history exchange.
 
     Peers write this rank's buffer and bump its semaphores, possibly before this rank's call starts, so both outlive
-    every call. The semaphores live on the exchange core, the compute grid's last core.
+    every call. The semaphores live on the exchange core, the compute grid's last core, and in L1_SMALL when the device
+    has one: their counts carry across calls, and a fabric mux may overwrite raw L1 below it.
     """
 
     buffer: ttnn.Tensor
@@ -70,6 +71,8 @@ class _HistoryExchange:
         grid = mesh_device.compute_with_storage_grid_size()
         exchange_core = ttnn.CoreCoord(grid.x - 1, grid.y - 1)
         exchange_cores = ttnn.CoreRangeSet({ttnn.CoreRange(exchange_core, exchange_core)})
+        l1_small = ttnn.get_memory_view(mesh_device, ttnn.BufferType.L1_SMALL)
+        semaphore_buffer_type = ttnn.BufferType.L1_SMALL if l1_small.total_bytes_per_bank > 0 else ttnn.BufferType.L1
         return cls(
             buffer=ttnn.zeros(
                 (1, KDA_HISTORY_EXCHANGE_ROWS, width),
@@ -79,7 +82,7 @@ class _HistoryExchange:
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             ),
             semaphores=[
-                ttnn.create_global_semaphore(mesh_device, exchange_cores, 0)
+                ttnn.create_global_semaphore(mesh_device, exchange_cores, 0, semaphore_buffer_type)
                 for _ in range(KDA_HISTORY_EXCHANGE_SEMAPHORES)
             ],
         )
