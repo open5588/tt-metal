@@ -140,8 +140,6 @@ class Gemma4PrefillRuntime:
             for layer_idx in range(self.config.num_layers):
                 self.layer_completion_sink(layer_idx, request_id)
         ttnn.deallocate(input_tensor)
-        if metadata_msg is not None:
-            ttnn.deallocate(metadata_msg)
 
     def kv_migration_stages(self, kv_cache, first_layer_idx, num_my_layers):
         from models.demos.common.prefill.runners.migration import KvCacheStage
