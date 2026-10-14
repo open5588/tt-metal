@@ -44,6 +44,11 @@ const FabricEriscDatamoverConfig& router_config(const ControlPlane& cp);
 
 // The stream a router counts receiver `channel`'s arrivals on. Assigned per fabric, never fixed.
 std::uint32_t receiver_pkts_sent_stream(const ControlPlane& cp, std::uint32_t mesh_id, std::uint32_t channel);
+std::uint32_t sender_pkts_completed_stream(
+    const ControlPlane& cp, std::uint32_t mesh_id, std::uint32_t vc, std::uint32_t index);
+std::uint32_t sender_pkts_acked_stream(
+    const ControlPlane& cp, std::uint32_t mesh_id, std::uint32_t vc, std::uint32_t index);
+bool sender_credits_use_streams(const ControlPlane& cp, std::uint32_t mesh_id, std::uint32_t vc, std::uint32_t index);
 
 // Reads a live config; does not own it and must not outlive it.
 class EriscBridgePlacement {

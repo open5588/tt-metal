@@ -28,6 +28,28 @@ std::uint32_t receiver_pkts_sent_stream(const ControlPlane& cp, std::uint32_t me
         .id(StreamRole::RECEIVER_PKTS_SENT, channel, 0);
 }
 
+// The sender's own credit registers, which a bridged link's far receiver can no longer reach. The
+// host writes what the relay carried; fabric assigns the ids, so a fixed one names another role.
+// vc and index, not "channel": for a sender role the group is keyed by VC and indexed by the
+// sender's position within it. Absent entirely when that VC returns credits as counters.
+std::uint32_t sender_pkts_completed_stream(
+    const ControlPlane& cp, std::uint32_t mesh_id, std::uint32_t vc, std::uint32_t index) {
+    return cp.get_fabric_context().get_builder_context().get_stream_assignment(MeshId{mesh_id}).id(
+        StreamRole::SENDER_PKTS_COMPLETED, vc, index);
+}
+
+std::uint32_t sender_pkts_acked_stream(
+    const ControlPlane& cp, std::uint32_t mesh_id, std::uint32_t vc, std::uint32_t index) {
+    return cp.get_fabric_context().get_builder_context().get_stream_assignment(MeshId{mesh_id}).id(
+        StreamRole::SENDER_PKTS_ACKED, vc, index);
+}
+
+// True when this VC returns credits by register. False means counters, and asking for an id fatals.
+bool sender_credits_use_streams(const ControlPlane& cp, std::uint32_t mesh_id, std::uint32_t vc, std::uint32_t index) {
+    return cp.get_fabric_context().get_builder_context().get_stream_assignment(MeshId{mesh_id}).has(
+        StreamRole::SENDER_PKTS_COMPLETED, vc, index);
+}
+
 BridgePlacement EriscBridgePlacement::place(std::uint32_t want_bytes) const {
     BridgePlacement p;
     p.block_bytes = want_bytes;
