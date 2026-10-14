@@ -84,6 +84,7 @@ Output:
                                             cluster_dump_<host>_<HHMMSS>.jsonl instead of <output>/dumps/,
                                             and the merged file as <directory>/cluster_<YYYY-MM-DD>_<HHMMSS>.jsonl.
                                             The log and metadata still go to --output. Needs a shared mount.
+                                            New host/date directories use the root's mode; new dumps use umask 022.
     --no-merge                              Stop after the per-host dumps; do not write cluster.jsonl.
                                             Merge later, anywhere: $TOOL_NAME merge --dumps <files>.
 
@@ -407,7 +408,15 @@ out_q=$(printf '%q' "$RANK_DUMP_DIR")
 root_probe=""
 if [[ -n "$PER_HOST_ROOT" ]]; then
     root_q=$(printf '%q' "$PER_HOST_ROOT")
-    root_probe="mkdir -p $root_q/\$h/$RUN_DATE 2>/dev/null && test -w $root_q/\$h/$RUN_DATE || rootbad=1"
+    root_probe="
+root_mode=\$(stat -c '%a' $root_q 2>/dev/null) || rootbad=1
+for d in $root_q/\$h $root_q/\$h/$RUN_DATE; do
+    if [[ ! -d \"\$d\" ]] && ! mkdir -m \"\$root_mode\" \"\$d\" 2>/dev/null && [[ ! -d \"\$d\" ]]; then
+        rootbad=1
+        break
+    fi
+done
+[[ -n \"\$rootbad\" ]] || test -w $root_q/\$h/$RUN_DATE || rootbad=1"
 fi
 # A tool missing on a host is "not installed" on a shared mount; with --no-shared-mount it was
 # copied there a moment ago, so its absence is a failure of that copy instead.
@@ -567,7 +576,9 @@ collect_bin=$(printf '%q ' "$RANK_TOOL" "${collect_args[@]}")
 if [[ -n "$PER_HOST_ROOT" ]]; then
     # <root>/<host>/<date>/cluster_dump_<host>_<stamp>.jsonl, the directory made by the rank.
     root_q=$(printf '%q' "$PER_HOST_ROOT")
-    RANK_TARGET="d=$root_q/\$h/$RUN_DATE; mkdir -p \"\$d\" && $collect_bin --out \"\$d/cluster_dump_\${h}_$RUN_STAMP.jsonl\""
+    RANK_TARGET="d=$root_q/\$h/$RUN_DATE
+out=\"\$d/cluster_dump_\${h}_$RUN_STAMP.jsonl\"
+(umask 0022; $collect_bin --out \"\$out\")"
 else
     dump_prefix=$(printf '%q' "$RANK_DUMP_DIR/cluster_dump_")
     RANK_TARGET="$collect_bin --out $dump_prefix\$h.jsonl"
@@ -737,7 +748,10 @@ fi
 # ---------------------------------------------------------------------------
 
 echo "Merging ${#dumps[@]} dump(s) into $CLUSTER_FILE ..."
-if ! "$TOOL" merge --cluster-name "$CLUSTER_NAME" --out "$CLUSTER_FILE" --dumps "${dumps[@]}"; then
+if ! (
+    [[ -z "$PER_HOST_ROOT" ]] || umask 0022
+    "$TOOL" merge --cluster-name "$CLUSTER_NAME" --out "$CLUSTER_FILE" --dumps "${dumps[@]}"
+); then
     echo "Error: merge failed" >&2
     exit 1
 fi
