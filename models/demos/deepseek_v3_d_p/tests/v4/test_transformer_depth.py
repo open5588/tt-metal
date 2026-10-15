@@ -84,6 +84,17 @@ def _await_handoff(chunk: int) -> torch.Tensor:
     return torch.load(path)
 
 
+def _log_dram(mesh_device, label, when):
+    """Per-chip DRAM: the mesh allocator places every buffer identically on each chip."""
+    view = ttnn.get_memory_view(mesh_device, ttnn.BufferType.DRAM)
+    gib = view.num_banks / 2**30
+    used, free = view.total_bytes_allocated_per_bank * gib, view.total_bytes_free_per_bank * gib
+    largest = view.largest_contiguous_bytes_free_per_bank * gib
+    logger.info(
+        f"[{label}] DRAM per chip {when}: {used:.2f} GiB used, {free:.2f} GiB free, largest free {largest:.2f} GiB"
+    )
+
+
 def _upload_streams(mesh_device, streams):
     """Host streams ``[1, S, n, D]`` -> the packed fp32 device streams a non-first rank takes."""
     ms = tuple(mesh_device.shape)
@@ -177,6 +188,7 @@ def run_depth(mesh_device, device_params, num_links, model_config, first, count,
     )
     del state_dict
     logger.info(f"built layers [{first}, {last}) in {(time.monotonic() - t0) / 60:.1f} min")
+    _log_dram(mesh_device, label, "after build")
 
     per_layer = {i: torch.zeros(1, SEQ_CACHE, n, hidden) for i in graded}
     final = torch.zeros(N_CHUNKS, hidden)
@@ -206,6 +218,8 @@ def run_depth(mesh_device, device_params, num_links, model_config, first, count,
             torch.save(streams_to_host(mesh_device, out, n), partial)
             os.replace(partial, _handoff_file(chunk))
         ttnn.deallocate(out)
+        if chunk == 0:
+            _log_dram(mesh_device, label, "after chunk 0")
         logger.info(f"  chunk {chunk} done (start={start}) in {time.monotonic() - t0:.0f} s")
 
     failures = []
