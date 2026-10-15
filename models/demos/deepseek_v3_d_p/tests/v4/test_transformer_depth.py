@@ -11,14 +11,16 @@ end to end through the checkpoint's LM head and compared with vLLM's next-token 
 
 Flash runs in one process. Pro does not fit one Galaxy whole, and 10..60 leaves too little DRAM headroom
 for a run that loads for hours first, so it runs in three: 0..9 from the embedding; 10..35 from the
-golden's layer-9 output, writing layer 35's streams to disk; and 36..60 from that file. The file is an
-exact (fp32) pipeline boundary, so 36..60 still sees only what the device computed from layer 9 on.
-The two tail rows depend on each other and run in that order.
+golden's layer-9 output, writing layer 35's streams to disk a chunk at a time; and 36..60 from those
+files. They are an exact (fp32) pipeline boundary, so 36..60 still sees only what the device computed
+from layer 9 on. The four rows fill a 4-Galaxy machine, one per Galaxy: 36..60 loads alongside 10..35
+and waits for each chunk's file, so the handoff dir must be on storage both hosts see.
 
 End-to-end metrics are logged, not asserted.
 """
 
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -56,6 +58,7 @@ _GOLDEN = {DeepSeekV4ProConfig: golden.V4_PRO, DeepSeekV4FlashConfig: golden.V4_
 _HEAD = "head.weight"
 _PRO_SPLIT = 36  # first layer of the second Pro tail process
 _HANDOFF = Path(os.getenv("V4_DEPTH_HANDOFF_DIR", "generated/v4_depth_handoff")) / "pro"
+_HANDOFF_WAIT_S = int(os.getenv("V4_DEPTH_HANDOFF_WAIT_S", "7200"))
 # The last layer is graded at its own floor: its PCC is carried by a few tokens whose norm is
 # hundreds of times the median. It measures Flash L42 0.5919, Pro L60 0.7457 to 0.7581, and moves by
 # about 0.01 across hosts and bases.
@@ -64,8 +67,21 @@ _LAST_LAYER_FLOOR = {DeepSeekV4FlashConfig: 0.58, DeepSeekV4ProConfig: 0.73}
 _GALAXY = [p for p in mesh_params(DeepSeekV4ProConfig.FABRIC_PAYLOAD_SIZE) if p.id == "torus-xy-8x4"]
 
 
+_ABORTED = _HANDOFF / "aborted"
+
+
 def _handoff_file(chunk: int) -> Path:
     return _HANDOFF / f"layer{_PRO_SPLIT - 1}_chunk{chunk:02d}.pt"
+
+
+def _await_handoff(chunk: int) -> torch.Tensor:
+    path = _handoff_file(chunk)
+    deadline = time.monotonic() + _HANDOFF_WAIT_S
+    while not path.is_file():
+        assert not _ABORTED.is_file(), f"layers 10..{_PRO_SPLIT - 1} failed before writing {path.name}"
+        assert time.monotonic() < deadline, f"no handoff at {path} after {_HANDOFF_WAIT_S} s"
+        time.sleep(10)
+    return torch.load(path)
 
 
 def _upload_streams(mesh_device, streams):
@@ -115,7 +131,7 @@ def run_depth(mesh_device, device_params, num_links, model_config, first, count,
     """Run layers ``[first, first + count)`` over the whole golden prompt and grade ``graded`` layers.
 
     The first rank starts from the prompt's tokens. Otherwise the input is the golden's layer-9 output
-    for layer 10, or the earlier tail process's handoff file for ``_PRO_SPLIT``. A rank that does not
+    for layer 10, or the 10..35 row's handoff files for ``_PRO_SPLIT``. A rank that does not
     end the model writes its last layer's streams to the handoff dir when that layer feeds
     ``_PRO_SPLIT``. Asserts rather than skips: a skipped row reads as a green one.
     """
@@ -134,9 +150,11 @@ def run_depth(mesh_device, device_params, num_links, model_config, first, count,
     assert not missing, f"{trace.path.name} did not keep decoder_output for layers {missing}"
     if not is_first and not from_golden:
         assert first == _PRO_SPLIT, f"layer {first} has no golden input and no handoff"
-        absent = [str(_handoff_file(c)) for c in range(N_CHUNKS) if not _handoff_file(c).is_file()]
-        assert not absent, f"no handoff for layer {first}; run the preceding tail row first. Missing: {absent[:2]}"
     writes_handoff = not is_last and last == _PRO_SPLIT
+    if writes_handoff:
+        # Before the load, so a reader started alongside cannot take a previous run's file.
+        shutil.rmtree(_HANDOFF, ignore_errors=True)
+        _HANDOFF.mkdir(parents=True)
 
     config = v4_hf_config(model_config, last, max_seq_len=SEQ_CACHE)
     n, hidden = config.hc_mult, config.hidden_size
@@ -160,8 +178,6 @@ def run_depth(mesh_device, device_params, num_links, model_config, first, count,
     del state_dict
     logger.info(f"built layers [{first}, {last}) in {(time.monotonic() - t0) / 60:.1f} min")
 
-    if writes_handoff:
-        _HANDOFF.mkdir(parents=True, exist_ok=True)
     per_layer = {i: torch.zeros(1, SEQ_CACHE, n, hidden) for i in graded}
     final = torch.zeros(N_CHUNKS, hidden)
     for chunk in range(N_CHUNKS):
@@ -178,14 +194,17 @@ def run_depth(mesh_device, device_params, num_links, model_config, first, count,
             streams = trace.decoder_output(first - 1, start, start + CHUNK).reshape(1, CHUNK, n, hidden)
             tt_in = _upload_streams(mesh_device, streams)
         else:
-            tt_in = _upload_streams(mesh_device, torch.load(_handoff_file(chunk)))
+            tt_in = _upload_streams(mesh_device, _await_handoff(chunk))
 
         out = model(tt_in, actual_isl=CHUNK, actual_start=start, layer_tap=tap)
         ttnn.deallocate(tt_in)
         if is_last:
             final[chunk] = hidden_to_host(mesh_device, out)[0, CHUNK - 1]
         elif writes_handoff:
-            torch.save(streams_to_host(mesh_device, out, n), _handoff_file(chunk))
+            # Renamed into place, so the reader never sees a partial file.
+            partial = _handoff_file(chunk).with_suffix(".partial")
+            torch.save(streams_to_host(mesh_device, out, n), partial)
+            os.replace(partial, _handoff_file(chunk))
         ttnn.deallocate(out)
         logger.info(f"  chunk {chunk} done (start={start}) in {time.monotonic() - t0:.0f} s")
 
@@ -228,7 +247,13 @@ def test_v4_pro_transformer_depth_head(mesh_device, device_params, num_links):
 @pytest.mark.skipif(not is_blackhole(), reason="V4 attention is Blackhole-only")
 @pytest.mark.timeout(0)
 def test_v4_pro_transformer_depth_tail_b1(mesh_device, device_params, num_links):
-    run_depth(mesh_device, device_params, num_links, DeepSeekV4ProConfig, 10, _PRO_SPLIT - 10, 0.98, [])
+    try:
+        run_depth(mesh_device, device_params, num_links, DeepSeekV4ProConfig, 10, _PRO_SPLIT - 10, 0.98, [])
+    except BaseException:
+        # Releases a reader waiting on a handoff that will not come.
+        _HANDOFF.mkdir(parents=True, exist_ok=True)
+        _ABORTED.touch()
+        raise
 
 
 @pytest.mark.parametrize("mesh_device, device_params, num_links", _GALAXY, indirect=["mesh_device", "device_params"])
